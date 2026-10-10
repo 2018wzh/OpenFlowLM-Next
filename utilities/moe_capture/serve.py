@@ -54,15 +54,18 @@ class Engine:
         spec = self.manifest['spec']
         return {'schema_version':1, 'protocol':'openflowlm.capture.v1', 'request_schema':'/api/v1/schema', 'backend':'native_openflowlm',
                 'model':{'family':self.manifest['family'], 'layers':spec['num_layers'],
-                         'hidden':spec['hidden'], 'experts':256, 'topk':8, 'vocab':spec['real_vocab'],
+                         'hidden':spec['hidden'], 'experts':256, 'shared_experts':1, 'topk':8, 'vocab':spec['real_vocab'],
                          'layer_types':spec['layer_types']},
                 'context_capacity':self.args.max_ctx, 'features':self.manifest.get('moe_capture',{}).get('capabilities',[]),
                 'capture':{'routes':'all input positions and layers', 'vector_layers':'selectable',
+                           'shared_gate_frequency':'every executed position and layer, independent of vector_layers',
                            'capture_positions':'prompt indices or all', 'micro_layers':'selectable, multiple layers or all selected vector layers',
                            'micro_rank':[0,7], 'ablation':'one position and layer per case, baseline TopK ranks'},
                 'execution':{'queue':'FIFO', 'concurrency':1, 'cancel':'next token boundary',
                              'case_limit':None, 'generation_limit':'context_capacity minus prompt length'},
                 'transport':{'events':'SSE', 'reconnect':'Last-Event-ID or after query',
+                             'compact_route':'routing.topk with native selected logits, probabilities and dispatched weights',
+                             'progress':'named progress heartbeat, no SSE id, approximately once per second',
                              'tensor_modes':['inline','references'], 'dtypes':['f32','i32','bf16'],
                              'byte_order':'little', 'request_bytes':self.args.max_request_bytes}}
 
@@ -192,6 +195,12 @@ class Engine:
 
     def packet(self, event, directory, run_id, inline=True):
         packet = dict(event,schema_version=1,protocol='openflowlm.capture.v1',run_id=run_id)
+        if event['kind'] == 'metadata':
+            packet['shared_experts'] = 1
+        if event['kind'] in ('route','logits'):
+            packet['display'] = self.tokenizer.decode([event['input_token_id']],skip_special_tokens=False)
+        if 'next_token_id' in event:
+            packet['next_token_display'] = self.tokenizer.decode([event['next_token_id']],skip_special_tokens=False)
         if event['kind'] == 'case':
             packet['tokens'] = [dict(t,display=self.tokenizer.decode([t['id']],skip_special_tokens=False),position=i) for i,t in enumerate(event['tokens'])]
         if event.get('tensors'):
@@ -210,11 +219,27 @@ class Engine:
                     packet['generated_text'] = self.tokenizer.decode([event['next_token_id']],skip_special_tokens=False)
                 else:
                     packet['tensors'] = []
+                    arrays = {}
                     for index,t in enumerate(event['tensors']):
                         stream.seek(t['offset']); raw = stream.read(t['length'])
                         if len(raw) != t['length']:
                             raise RuntimeError('published tensor is incomplete')
+                        if event['kind'] in ('route','moe_output'):
+                            arrays[(t['name'],t.get('slot'))] = np.frombuffer(raw,dtype='<i4' if t['dtype']=='i32' else '<f4')
                         packet['tensors'].append(dict(t,href=f'/api/v1/runs/{run_id}/tensors/{event["event_seq"]}/{index}', **({'data':base64.b64encode(raw).decode('ascii')} if inline else {})))
+                    if event['kind']=='route':
+                        ids=arrays[('expert_ids',None)]; logits=arrays[('router_logits',None)]
+                        probabilities=arrays[('router_probabilities',None)]; weights=arrays[('expert_weights',None)]
+                        packet['routing']={'source':'derived','value_source':'native_openflowlm',
+                            'topk':[{'id':int(i),'logit':float(logits[i]),'prob':float(probabilities[i]),'weight':float(w)} for i,w in zip(ids,weights)]}
+                    if event['kind']=='moe_output':
+                        norm=lambda v:float(np.linalg.norm(v.astype(np.float64)))
+                        shared=arrays[('shared_output',8)]
+                        gate=float(arrays[('shared_gate',None)][0])
+                        packet['norms']={'source':'derived','routed_mixture_l2':norm(arrays[('routed_mixture',None)]),
+                            'shared_output_l2':norm(shared),'gated_shared_output_l2':abs(gate)*norm(shared),
+                            'residual_after_l2':norm(arrays[('residual_after',None)]),
+                            'expert_output_l2':[norm(arrays[('expert_output',i)]) for i in range(8)]}
         return packet
 
 
@@ -323,14 +348,27 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_response(200); self.send_header('Content-Type','text/event-stream; charset=utf-8')
             self.send_header('Cache-Control','no-store'); self.send_header('Connection','close'); self.end_headers()
             stream = None
+            last_progress = 0.0
+            cursor = after
+            context = {}
             try:
                 while True:
+                    now = time.monotonic()
+                    if now-last_progress >= 1:
+                        progress={'schema_version':1,'protocol':'openflowlm.capture.v1','run_id':run_id,
+                                  'state':run['state'],'last_event_seq':cursor,'context':context}
+                        self.wfile.write(('event: progress\ndata: '+json.dumps(progress,ensure_ascii=False)+'\n\n').encode('utf-8'))
+                        self.wfile.flush(); last_progress=now
                     if stream is None and (run['directory']/'events.jsonl').exists():
                         stream = (run['directory']/'events.jsonl').open('r',encoding='utf-8')
                     mark = stream.tell() if stream else 0
                     line = stream.readline() if stream else ''
                     if line.endswith('\n'):
                         event = json.loads(line)
+                        cursor = max(cursor,event['event_seq'])
+                        if event['kind'] in ('case','run'): context = {}
+                        for field in ('case','run','phase','position','input_token_id','layer'):
+                            if field in event and not (field=='layer' and event[field]<0): context[field]=event[field]
                         if event['event_seq'] > after:
                             packet = engine.packet(event,run['directory'],run_id,mode=='inline')
                             packet['host_elapsed_ms'] = round((time.time()-run.get('started_at',run['created_at']))*1000)

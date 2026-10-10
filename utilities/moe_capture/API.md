@@ -1,6 +1,6 @@
 # OpenFlowLM capture API v1
 
-所有客户端使用 `/api/v1`。SSE 事件含 `schema_version: 1`、`protocol: "openflowlm.capture.v1"`、`run_id` 和单调递增的 `event_seq`。旧的无版本 HTTP 接口已移除。原生二进制文件与事件索引仍采用 capture format 1。
+所有客户端使用 `/api/v1`。原生采集的 SSE 事件含 `schema_version: 1`、`protocol: "openflowlm.capture.v1"`、`run_id` 和单调递增的 `event_seq`；传输层 progress 心跳不占事件序号。旧的无版本 HTTP 接口已移除。原生二进制文件与事件索引仍采用 capture format 1。
 
 ## 启动与能力
 
@@ -61,7 +61,7 @@ python utilities/moe_capture/serve.py --allow-origin http://localhost:5173
 
 ## 事件与张量
 
-`GET /api/v1/runs/<id>/events?tensors=inline` 返回 SSE；`tensors=references` 只返回描述符。客户端可以使用 `Last-Event-ID` 或 `after=<seq>` 从已接收位置续接，前者优先。事件类别包括 metadata/case/run/route/moe_input/moe_output/expert_detail/logits/continuation/comparison/complete。未知扩展类别应忽略；未知协议版本应报错。失败或取消使用 `event: failure`，客户端关闭 EventSource 并根据运行状态展示部分结果。
+`GET /api/v1/runs/<id>/events?tensors=inline` 返回 SSE；`tensors=references` 只返回张量描述符，同时保留紧凑标量字段。客户端可以使用 `Last-Event-ID` 或 `after=<seq>` 从已接收位置续接，前者优先。事件类别包括 metadata/case/run/route/shared_gate/moe_input/moe_output/expert_detail/logits/continuation/run_summary/comparison/complete，另有传输层 progress 心跳。未知扩展类别应忽略；未知协议版本应报错。失败或取消使用 `event: failure`，客户端关闭 EventSource 并根据运行状态展示部分结果。
 
 张量描述符含 name/dtype/shape/offset/length/source/event_seq，以及专家张量的 slot/expert_id。dtype 为 f32/i32/bf16，字节序 little。inline 模式的非 logits 张量附带 Base64 `data`；所有张量均提供相对 `href`。完整词表 logits 始终通过 href 按需读取，以避免每个 SSE 包携带大型词表。logits 事件另附 derived Top16 概率与 next_token_id 对应的文本。
 
@@ -93,3 +93,17 @@ events.addEventListener('failure', () => events.close());
 ```
 
 单个 NPU runtime 仍串行运行；这是当前原生执行模型。扩展请求范围会增加推理时间、张量体积和内存需求，API 不通过隐藏截断限制请求规模。
+
+## 主面板紧凑事件
+
+每条 route SSE 含 `routing: {source:"derived", value_source:"native_openflowlm", topk:[{id,logit,prob,weight}]}`。Top8 顺序来自实际派发记录；每项数值直接读取原生张量，不重新 softmax 或归一化权重。derived 指紧凑投影的整理方式。references 模式也携带这些标量，主面板无需额外下载路由张量。
+
+route/logits 的 `display` 解码 **input_token_id**，包括 decode 位置；logits 的 `next_token_display` 解码预测或 teacher-forced 的 next_token_id，与 generated_text 含义相同。不要把 display 当作随后生成的 token。capabilities.model 和 metadata 显式提供 `shared_experts:1`。
+
+每个原生 route 对应一个稍后发布的 `shared_gate` 事件，以 case/run/phase/position/layer 关联。其 `value` 是原生 sigmoid 门值，source 为 native_openflowlm，并附带原始 f32 标量张量。该事件在全部层、prefill/decode/teacher forcing 同频采集，不依赖 vector_layers 或 micro_layers；门值在专家阶段完成后才可读，不延迟 route 的发布。旧历史数据没有此独立事件，不能据此填零。
+
+moe_output SSE 附 `norms`，source 为 derived，包含 routed_mixture_l2、shared_output_l2、gated_shared_output_l2、residual_after_l2 和按实际 slot 排序的 expert_output_l2 数组。只有请求了向量采集点才生成这些范数；不为范数单独打开重向量采集。范数采用原生输出的 float64 离线 L2 计算，包含门值后的共享范数为 abs(gate) × shared_output_l2。
+
+每个正常完成的前向 run 后发布原生事件索引中的 `run_summary`：source 为 derived；phases 统计各阶段执行的输入位置数；layers 提供每层 positions、256 项 expert_dispatch_counts、expert_weight_sums、mean_router_entropy_nats。熵为全部 256 个原生概率的 `-sum(p*ln(p))`，再按位置平均；不是 Top8 权重的熵。负载统计原始 Top8（含被消融槽），不声称它是有效贡献或专家专业度。取消或失败中的 run 不补完整摘要；已正常完成的前序 run 摘要仍有效，整个请求仍需 complete 才算正常完成。
+
+SSE 每约一秒发送 `event: progress`，data 含 schema_version/protocol/run_id/state/last_event_seq/context。context 保存该连接最近读到的 case/run/phase/position/input_token_id/layer，尚未执行时为空。progress 不带 SSE id，不改变 Last-Event-ID，不持久化到原生事件索引，不表示精确算子进度或剩余时间。历史重放时描述该连接的读取进度；只在 complete 消息后关闭正常事件流。

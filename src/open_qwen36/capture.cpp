@@ -72,6 +72,7 @@ MoeCapture::MoeCapture(CaptureWriter& writer, const json& layout)
 }
 
 void MoeCapture::begin_case(const json& value) {
+    end_run();
     case_ = value;
     std::fill(std::begin(references_), std::end(references_), -1);
     writer_.event({{"kind", "case"}, {"case", case_.at("id")}, {"text", case_.at("text")},
@@ -85,10 +86,26 @@ void MoeCapture::begin_case(const json& value) {
 }
 
 void MoeCapture::begin_run(const std::string& name, int ablate_rank) {
+    end_run();
     run_ = name;
+    loads_ = {};
+    phases_ = json::object();
     ablate_rank_ = ablate_rank;
     writer_.event({{"kind", "run"}, {"case", case_.at("id")}, {"run", run_},
                    {"ablate_rank", ablate_rank}, {"ablate_expert", ablate_rank < 0 ? -1 : target(ablate_rank)}});
+}
+
+void MoeCapture::end_run() {
+    if (run_.empty()) return;
+    json layers = json::array();
+    for (size_t l = 0; l < loads_.size(); ++l) {
+        const auto& a = loads_[l];
+        layers.push_back({{"layer",l},{"positions",a.positions},{"expert_dispatch_counts",a.counts},
+                          {"expert_weight_sums",a.weights},{"mean_router_entropy_nats",a.positions ? a.entropy/a.positions : 0.0}});
+    }
+    writer_.event({{"kind","run_summary"},{"case",case_.at("id")},{"run",run_},{"source","derived"},
+                   {"phases",phases_},{"layers",layers},{"load_definition","original Top8 dispatches and weights, including masked slot"}});
+    run_.clear();
 }
 
 void MoeCapture::input(const std::string& phase, int position, int token) {
@@ -133,6 +150,14 @@ int MoeCapture::route(Core& core, int layer, const uint8_t* record) {
         writer_.tensor("router_probabilities", "f32", {256}, record, 1024),
         writer_.tensor("expert_ids", "i32", {8}, record + 1024, 32),
         writer_.tensor("expert_weights", "f32", {8}, record + 1056, 32)});
+    float probabilities[256], weights[8];
+    std::memcpy(probabilities, record, sizeof(probabilities));
+    std::memcpy(weights, record + 1056, sizeof(weights));
+    auto& load = loads_.at(layer);
+    ++load.positions;
+    for (float p : probabilities) if (p > 0) load.entropy -= static_cast<double>(p)*std::log(static_cast<double>(p));
+    for (int i=0;i<8;++i) { ++load.counts.at(current_ids_[i]); load.weights.at(current_ids_[i]) += weights[i]; }
+    if (layer==0) phases_[phase_] = phases_.value(phase_, uint64_t(0)) + 1;
     writer_.event(std::move(e));
     if (selected(layer)) {
         const auto& lt = layout_.at("layer_types").at(core.manifest().layer_type(layer).name);
@@ -148,8 +173,15 @@ int MoeCapture::route(Core& core, int layer, const uint8_t* record) {
 }
 
 void MoeCapture::after_layer(Core& core, int layer) {
-    if (!selected(layer)) return;
     const auto& lt = layout_.at("layer_types").at(core.manifest().layer_type(layer).name);
+    const auto& gate_field = layout_.at("fields").at("shared_gate");
+    float gate;
+    core.read_act(layer, lt.at("base").get<size_t>() + gate_field.at("offset").get<size_t>(), sizeof(gate), reinterpret_cast<uint8_t*>(&gate));
+    json gate_event = context(layer);
+    gate_event.update({{"kind","shared_gate"},{"value",gate},{"source","native_openflowlm"}});
+    gate_event["tensors"] = json::array({writer_.tensor("shared_gate","f32",{1},&gate,sizeof(gate))});
+    writer_.event(std::move(gate_event));
+    if (!selected(layer)) return;
     std::vector<uint8_t> bytes(layout_.at("bytes").get<size_t>()), residual(2048 * 4);
     core.read_act(layer, lt.at("base").get<size_t>(), bytes.size(), bytes.data());
     core.read_residual(residual.data());
@@ -222,7 +254,7 @@ int run_capture(Core& core, const std::string& config, const std::string& direct
     if (layout.is_null()) throw std::runtime_error("kernel set has no MoE capture capability");
     CaptureWriter writer(directory, c.value("live", false));
     writer.event({{"kind", "metadata"}, {"version", 1}, {"backend", "native_openflowlm"},
-                  {"model", "Qwen3.6-35B-A3B"}, {"layers", 40}, {"experts", 256}, {"topk", 8},
+                  {"model", "Qwen3.6-35B-A3B"}, {"layers", 40}, {"experts", 256}, {"shared_experts",1}, {"topk", 8},
                   {"byte_order", "little"}, {"precision", "native Q4NX packing; BF16 activations; F32 accumulators and logits"},
                   {"spec", core.manifest().hf_config_check}, {"capture_layout_version", 1},
                   {"execution_quantization", core.manifest().model_spec.value("quant", json("q4_1"))},
@@ -320,6 +352,7 @@ int run_capture(Core& core, const std::string& config, const std::string& direct
             }
             writer.event({{"kind", "comparison"}, {"case", value.at("id")}, {"source", "derived"}, {"scores", scores}});
         }
+        capture.end_run();
         core.set_capture(nullptr);
         writer.finish();
     } catch (...) {

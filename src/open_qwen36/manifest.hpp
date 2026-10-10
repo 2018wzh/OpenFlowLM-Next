@@ -204,6 +204,8 @@ struct RowGlobal {
 };
 
 struct Manifest {
+    nlohmann::json moe_capture;
+    nlohmann::json model_spec;
     int version = 0;
     std::string family, spec_hash, build_key;
     size_t max_ctx_default = 0;

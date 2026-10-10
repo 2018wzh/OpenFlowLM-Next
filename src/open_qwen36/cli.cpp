@@ -39,10 +39,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <string>
 #include <vector>
 
 #include "open_qwen36/core.hpp"
+#include "open_qwen36/capture.hpp"
 
 using open_qwen36::Core;
 using open_qwen36::CoreConfig;
@@ -86,6 +88,8 @@ void dump_pos(const std::string& prefix, int pos, const std::vector<float>& v) {
 }
 
 struct Args {
+    std::string capture_config, capture_out;
+    bool capture_server = false;
     CoreConfig cfg;
     std::vector<int> ids;
     int max_tokens = 16;
@@ -161,6 +165,9 @@ Args parse(int argc, char** argv) {
             return argv[++i];
         };
         if (k == "--model") a.cfg.model_dir = val();
+        else if (k == "--capture-config") a.capture_config = val();
+        else if (k == "--capture-server") a.capture_server = true;
+        else if (k == "--capture-out") a.capture_out = val();
         else if (k == "--kernels") a.cfg.kernel_dir = val();
         else if (k == "--prefill-mode") a.cfg.prefill_mode = val();
         else if (k == "--ids") a.ids = parse_ids(val());
@@ -202,7 +209,15 @@ Args parse(int argc, char** argv) {
         else if (k == "--decode-schedule") a.decode_schedule = val();     // Stage 2.7
         else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); std::exit(2); }
     }
-    if (a.cfg.model_dir.empty() || a.cfg.kernel_dir.empty() || a.ids.empty()) {
+    if (a.capture_config.empty() != a.capture_out.empty()) {
+        std::fprintf(stderr, "--capture-config and --capture-out must be supplied together\n");
+        std::exit(2);
+    }
+    if (!a.capture_config.empty() && (a.gemm_block || a.block_major || a.at_position || !a.decode_schedule.empty())) {
+        std::fprintf(stderr, "capture uses per-token NPU execution from position zero\n");
+        std::exit(2);
+    }
+    if (a.cfg.model_dir.empty() || a.cfg.kernel_dir.empty() || (a.ids.empty() && a.capture_config.empty() && !a.capture_server)) {
         std::fprintf(stderr, "usage: open_qwen36_cli --model <dir> --kernels <dir> --ids 1,2,3 [--max-tokens N] "
                              "[--layers N] [--max-ctx N] [--dump-logits <prefix>] [--twice] [--at-position P] "
                              "[--gemm-block] [--block-major] [--prefill-logits] [--bench N[:LAYER]] [--bench-decode N] "
@@ -376,7 +391,27 @@ int main(int argc, char** argv) {
     try {
         auto t0 = std::chrono::steady_clock::now();
         Core core(a.cfg);
+        if (!a.capture_config.empty() || a.capture_server)
+            open_qwen36::require_capture_layout(core.manifest().moe_capture);
         core.load_weights();
+        if (a.capture_server) {
+            std::puts("{\"ready\":true}"); std::fflush(stdout);
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                try {
+                    auto request = nlohmann::json::parse(line);
+                    open_qwen36::run_capture(core, request.at("config"), request.at("output"));
+                    std::puts("{\"ok\":true}");
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "capture request failed: %s\n", e.what());
+                    std::puts("{\"ok\":false}");
+                }
+                std::fflush(stdout);
+            }
+            return 0;
+        }
+        if (!a.capture_config.empty())
+            return open_qwen36::run_capture(core, a.capture_config, a.capture_out);
         // Stage 2.7: the runtime decode route (env only set the initial one).
         // Stage 2.10 P6: auto is the default when nothing named a route --
         // NPU-first since the fast attention promotion -- but the 2.6 env's

@@ -104,6 +104,9 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
     def main_body(win, xin, yout, *args):
         B, K = X.unpack_args(args)
         tab = B["tab"]
+        if X.CAPTURE and part == 1:
+            X.moe_body(win, xin, yout, B, K)
+            return
         if DENSE:
             # ONE stream: q | gate | k | v, the o projection, then the dense FFN tail.
             X.prep_bands(win, xin, yout, B, K, HID, XN_ELEMS, 2 * Q_PC + 2 * KV_PC, "attn")
@@ -119,6 +122,8 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
         K["prep4096b"](oe[1], tab)
         X.role_gemv_bands(win, yout, B, K, "attn", O_PC, O_K)
         xin.release(2)
+        if X.CAPTURE:
+            return
         X.moe_body(win, xin, yout, B, K)
 
     workers = ([XL.ln_worker(of_lni, of_lno, tl, L)] + XL.main_workers(main_body, of_w, of_x, of_y, t, K)

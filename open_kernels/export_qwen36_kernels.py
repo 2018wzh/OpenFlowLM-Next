@@ -211,6 +211,7 @@ def main() -> int:
     ap.add_argument("--only", default=None, help="comma-separated subset of the recipe's kernel sets")
     ap.add_argument("--no-build", action="store_true", help="copy/hash the existing build dirs without rebuilding")
     ap.add_argument("--force", action="store_true", help="rebuild even when <out>/manifest.json has this build key")
+    ap.add_argument("--capture", action="store_true", help="build the dedicated per-token MoE capture kernels")
     ap.add_argument("--max-ctx", type=int, default=4096, help="the manifest's default context capacity")
     ap.add_argument("--check", metavar="DIR",
                     help="a previous export (or a shipped xclbins/<model>/open_kernels dir) to compare "
@@ -221,6 +222,10 @@ def main() -> int:
     ap.add_argument("-j", "--jobs", type=int, default=1,
                     help="kernel-set builds to run in parallel within this spec (default: 1)")
     a = ap.parse_args()
+    if a.capture:
+        if a.check:
+            ap.error("--capture does not produce rebuild comparison reports")
+        os.environ["OFLM_MOE_CAPTURE"] = "1"
 
     # ---- the spec, its recipe, and the kernel sets that recipe names
     if a.model_dir:
@@ -249,6 +254,11 @@ def main() -> int:
             )
         raise
     sets = F.builds(spec)
+    if a.capture:
+        sets = {k: v for k, v in sets.items() if k in {"lx0", "lx1", "ax0", "ax1", "ln", "lm_head_q8"}}
+        for k, v in sets.items():
+            if k.startswith(("lx", "ax")):
+                v["build_dir"] += "_capture"
     names = [n.strip() for n in a.only.split(",") if n.strip()] if a.only else list(sets)
     bad = [n for n in names if n not in sets]
     if bad:
@@ -313,12 +323,16 @@ def main() -> int:
             if srcf.resolve() != (dst / f).resolve():
                 shutil.copyfile(srcf, dst / f)
             k = f"{n}/{f}"
-            hashes[k] = sha256(dst / f)
-            print(f"  {hashes[k]}  {k}  ({(dst / f).stat().st_size} B)")
+            if not a.capture:
+                hashes[k] = sha256(dst / f)
+            print(f"  {k}  ({(dst / f).stat().st_size} B)")
 
     # ---- the manifest and the toolchain record
     m = manifest(spec, a.max_ctx, key)
     mj.write_text(dumps(m), encoding="utf-8", newline="\n")
+    if a.capture:
+        print("Capture kernels and manifest ready")
+        return
     info = {
         "model": spec.extra.get("model", spec.family),
         "spec_hash": spec.spec_hash(),

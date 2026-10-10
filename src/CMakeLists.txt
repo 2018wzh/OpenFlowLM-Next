@@ -302,6 +302,7 @@ if(NOT OFLM_USE_HRX)
         "${CMAKE_CURRENT_SOURCE_DIR}/open_qwen36/manifest.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/open_qwen36/pools.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/open_qwen36/core.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/open_qwen36/capture.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/open_qwen36/block_host.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/open_qwen36/engine.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/open_qwen36/vision/vit.cpp")

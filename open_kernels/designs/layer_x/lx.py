@@ -102,6 +102,9 @@ def lx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Com
     def main_body(win, xin, yout, *args):
         B, K = X.unpack_args(args)
         tab = B["tab"]
+        if X.CAPTURE and part == 1:
+            X.moe_body(win, xin, yout, B, K)
+            return
         if DENSE:
             # ONE stream: qkv | z, DeltaNet, the out projection, then the dense FFN tail.
             X.prep_bands(win, xin, yout, B, K, HID, XN_ELEMS, QKV_PC + Z_PC, "linear")
@@ -122,6 +125,8 @@ def lx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Com
         X.role_gemv_bands(win, yout, B, K, "linear_out", OUT_PC, OUT_K)
         xin.release(2)
         # part 1: the MoE block
+        if X.CAPTURE:
+            return
         X.moe_body(win, xin, yout, B, K)
 
     workers = ([XL.ln_worker(of_lni, of_lno, tl, L)] + XL.main_workers(main_body, of_w, of_x, of_y, t, K)

@@ -293,7 +293,11 @@ GEMV_Q4_PREP_BLOCKS_ENTRY({kw}, {nb}, {nb})
 
 extern "C" {{
 void gemv_q4_prep_h(const float *__restrict hf, uint8_t *__restrict tab) {{
-  gemv_q4_prep_f32(hf, tab + {C.H_TAB_OFF}, {ff});
+  gemv_q4_prep_f32(hf, tab + {C.H_TAB_OFF}, {ff}
+#ifdef MOE_CAPTURE
+                     , (bfloat16 *)(tab + {C.TAB_BYTES})
+#endif
+                     );
 }}
 }}
 ''',
@@ -311,6 +315,9 @@ void moe_hdr2(const uint8_t *__restrict e, const bfloat16 *__restrict xm, float 
   float *__restrict xr = ms + {C.MS_XR};
   if (mode == 0) {{
     aie::store_v(rw, aie::load_v<32>((const float *)(e + {Q.ROUT_IDX_OFF})));
+#ifdef MOE_CAPTURE
+    ((int32_t *)ms)[16] = *(const int32_t *)(e + 2112);
+#endif
   }} else if (mode == 1) {{
     const bfloat16 *__restrict sgw = (const bfloat16 *)e;
     accf32 d = aie::zeros<accfloat, 32>();
@@ -334,13 +341,18 @@ void moe_hdr2(const uint8_t *__restrict e, const bfloat16 *__restrict xm, float 
 #include "vecmath.h"
 
 extern "C" {{
-void moe_silu32(const float *__restrict ms, float *__restrict h) {{
+void moe_silu32(float *__restrict ms, float *__restrict h) {{
   aie::set_rounding(aie::rounding_mode::conv_even);
   const float *__restrict u = ms + {C.MS_U};
-  const float *__restrict g = ms + {C.MS_G};
+  float *__restrict g = ms + {C.MS_G};
 #pragma clang loop unroll(disable)
-  for (unsigned j = 0; j < {C.HID_PC}; j += 32)
-    aie::store_v(h + j, fmul32(vsiluN<32>(aie::load_v<32>(g + j)), aie::load_v<32>(u + j)));
+  for (unsigned j = 0; j < {C.HID_PC}; j += 32) {{
+    const auto s = vsiluN<32>(aie::load_v<32>(g + j));
+#ifdef MOE_CAPTURE
+    aie::store_v(g + j, s);
+#endif
+    aie::store_v(h + j, fmul32(s, aie::load_v<32>(u + j)));
+  }}
 }}
 }}
 ''',
@@ -371,7 +383,11 @@ void moe_accfin(float *__restrict ms, int32_t slot) {{
       a = aie::zeros<accfloat, 32>();
     else
       a.from_vector(aie::load_v<32>(acc + j));
-    if (!close) {{
+    if (!close
+#ifdef MOE_CAPTURE
+        && (shared || ((const int32_t *)ms)[16] != slot)
+#endif
+        ) {{
       v32b yh, yl;
       split32(aie::load_v<32>(y + j), yh, yl);
       a = aie::mac(a, yh, wh);
@@ -395,6 +411,29 @@ void moe_out(const float *__restrict ms, float *__restrict y, int32_t j) {{
 }}
 ''',
     }
+    from recipes.moe_capture import enabled
+    if enabled():
+        out["moe_capture.cc"] = f'''#include "vecmath.h"
+extern "C" {{
+// A tap of the native scratch; no expert computation is repeated here.
+void moe_capture(const float *ms, const uint8_t *tab, float *y, int32_t kind, int32_t j) {{
+  if (kind == 6) {{
+    const uint8_t *p = tab + {C.TAB_BYTES} + 256 * j;
+    aie::store_v((uint8_t *)y, aie::load_v<64>(p));
+    aie::store_v((uint8_t *)y + 64, aie::load_v<64>(p + 64));
+    aie::store_v((uint8_t *)y + 128, aie::load_v<64>(p + 128));
+    aie::store_v((uint8_t *)y + 192, aie::load_v<64>(p + 192));
+  }} else if (kind == 5) {{
+    const auto g = aie::broadcast<float, 32>(ms[0]);
+    aie::store_v(y, g); aie::store_v(y + 32, g);
+  }} else {{
+    const unsigned off = kind == 0 ? {C.MS_U} : kind <= 2 ? {C.MS_G} : kind == 3 ? {C.MS_YD} : {C.MS_ACC};
+    aie::store_v(y, aie::load_v<32>(ms + off + 64 * j));
+    aie::store_v(y + 32, aie::load_v<32>(ms + off + 64 * j + 32));
+  }}
+}}
+}}
+'''
     out.update(DNX)
     out.update(q8_files(R))
     return out

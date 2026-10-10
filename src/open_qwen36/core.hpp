@@ -48,6 +48,7 @@
 #include "stream_patch.hpp"
 
 namespace open_qwen36 {
+class MoeCapture;
 
 struct CoreConfig {
     std::string model_dir;   ///< holds config.json + model.q4nx (+ tokenizer files)
@@ -126,6 +127,8 @@ public:
 
     /// Start a new context: zero the linear states, position 0.
     void reset();
+    void set_capture(MoeCapture* capture);
+    void read_residual(uint8_t* dst);
     /// One decode step for `token` at the current position. Logits (f32,
     /// vocab) are computed only when asked for; read them with logits().
     void step(int token, bool want_logits);
@@ -264,6 +267,7 @@ public:
     const Manifest& manifest() const { return man_; }
     size_t vocab() const { return man_.vocab; }
     size_t real_vocab() const { return man_.real_vocab; }
+    size_t context_capacity() const { return cfg_.max_ctx; }
 
     Snapshot checkpoint() const;
     void restore(const Snapshot& s);
@@ -274,6 +278,7 @@ public:
     const Q4nxFile& file() const { return *file_; }
 
 private:
+    MoeCapture* capture_ = nullptr;
     struct Kern {
         std::string name;
         std::string patch;

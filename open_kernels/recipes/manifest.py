@@ -79,6 +79,33 @@ def manifest(spec: ModelSpec, max_ctx: int = 4096, key: str | None = None) -> di
     for lt, d in plan.pop("layer_types").items():
         m["layer_types"][lt]["pack"] = d
     m["pack"] = plan          # pool_bytes, chunk_bytes, lm_head {pool_bytes, ops}, embed, norm
+    from . import moe_capture
+    if moe_capture.enabled():
+        if spec.family != "qwen36moe" or (spec.hidden, spec.moe_intermediate, spec.experts_per_tok) != (2048, 512, 8):
+            raise ValueError("MoE capture supports Qwen3.6-35B-A3B only")
+        c = moe_capture.layout(spec.hidden, spec.moe_intermediate, spec.experts_per_tok)
+        l = F.layout(spec)
+        c["layer_types"] = {
+            "linear_attention": {"base": l.A_HP + 4096, "xm": l.A_XM, "residual": l.A_RES},
+            "full_attention": {"base": l.AA_HP + 4096, "xm": l.AA_XM, "residual": l.AA_RES}}
+        m["moe_capture"] = c
+        for lt in m["layer_types"].values():
+            lt.pop("gemm_block", None)
+            lt.pop("gemm_block_variants", None)
+        # The dedicated capture path builds only sequential layer streams and the head.
+        keep = {"lx0", "lx1", "ax0", "ax1", "ln", "lm"}
+        m["kernels"] = {k: v for k, v in m["kernels"].items() if k in keep}
+        used = {v["context"] for v in m["kernels"].values()}
+        m["contexts"] = {k: v for k, v in m["contexts"].items() if k in used}
+        for name in ("lx0", "lx1", "ax0", "ax1"):
+            m["contexts"][name] = f"{name}/final.xclbin"
+            m["kernels"][name]["context"] = name
+        m["contexts"].pop("lx", None)
+        m["contexts"].pop("ax", None)
+        m["globals"] = {k: v for k, v in m["globals"].items()
+                        if k in {"xres", "zero", "normw", "xresf", "hn", "logits", "lmpool", "ptab"}}
+        m["builds"] = {k: v for k, v in m["builds"].items()
+                       if k in {"lx0", "lx1", "ax0", "ax1", "ln", "lm_head_q8"}}
     if has_split_step(m["layer_types"]):
         m["manifest_version"] = SPLIT_MANIFEST_VERSION
     if has_gemm_pool_op(m["layer_types"]):

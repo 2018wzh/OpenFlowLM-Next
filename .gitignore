@@ -95,3 +95,6 @@ src/xclbins/*/open_kernels*/
 result
 result-*
 bin/
+.tmp/
+models/
+captures/

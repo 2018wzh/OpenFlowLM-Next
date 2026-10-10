@@ -129,7 +129,11 @@ static inline void gemv_q4_prep(const bfloat16 *__restrict x, uint8_t *__restric
 // The same from an fp32 activation, rounded to bf16 (conv_even) first --
 // exactly what a producer that emits bf16 would have done.
 __attribute__((noinline)) inline void gemv_q4_prep_f32(const float *__restrict xf, uint8_t *__restrict tab,
-                                                       unsigned K) {
+                                                       unsigned K
+#ifdef MOE_CAPTURE
+                                                       , bfloat16 *rounded = nullptr
+#endif
+                                                       ) {
   const unsigned NB = K / 32;
   aie::set_rounding(aie::rounding_mode::conv_even);
   int16_t *__restrict xi = (int16_t *)tab;
@@ -141,7 +145,11 @@ __attribute__((noinline)) inline void gemv_q4_prep_f32(const float *__restrict x
   for (unsigned kb = 0; kb < NB; ++kb) {
     aie::accum<accfloat, 32> a;
     a.from_vector(aie::load_v<32>(xf + kb * 32));
-    gemv_q4_prep_block(a.template to_vector<bfloat16>(), xi, sh, xsh, xsl, kb, absmask);
+    const auto xb = a.template to_vector<bfloat16>();
+#ifdef MOE_CAPTURE
+    if (rounded) aie::store_v(rounded + kb * 32, xb);
+#endif
+    gemv_q4_prep_block(xb, xi, sh, xsh, xsl, kb, absmask);
   }
 }
 

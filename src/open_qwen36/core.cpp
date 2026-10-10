@@ -1,6 +1,7 @@
 /// \file core.cpp
 /// \brief The resident open-kernel decode engine: a manifest interpreter (see core.hpp).
 #include "open_qwen36/core.hpp"
+#include "open_qwen36/capture.hpp"
 
 #include <algorithm>
 #include <array>
@@ -687,9 +688,10 @@ void Core::reset() {
     // k'/v' both guarantee.
     for (int l = 0; l < nl_; ++l) {
         const LayerType& lt = *types_[l];
-        if (lt.state_kind != "linear") continue;
-        std::memset(state_[l].map<uint8_t*>(), 0, lt.state_bytes);
-        state_[l].sync(XCL_BO_SYNC_BO_TO_DEVICE, lt.state_bytes, 0);
+        if (lt.state_kind != "linear" && !capture_) continue;
+        const size_t bytes = state_[l].size();
+        std::memset(state_[l].map<uint8_t*>(), 0, bytes);
+        state_[l].sync(XCL_BO_SYNC_BO_TO_DEVICE, bytes, 0);
     }
     // A request with an image rewrote the position records of the rows it used
     // (write_record); the next request expects row p to say position p again.
@@ -720,6 +722,23 @@ xrt::bo& Core::buffer(const std::string& name, int layer) {
     auto it = globals_.find(name);
     if (it == globals_.end()) throw std::runtime_error("open_qwen36: the program names an unknown buffer '" + name + "'");
     return it->second;
+}
+
+void Core::set_capture(MoeCapture* capture) {
+    if (capture && (man_.moe_capture.is_null() || man_.moe_capture.value("version", 0) != 1))
+        throw std::runtime_error("MoE capture requires capture-capable kernels (export --capture)");
+    capture_ = capture;
+    if (capture) {
+        set_decode_route("npu");
+        route_sentinel_ = true;
+        route_check_ = false;
+    }
+}
+
+void Core::read_residual(uint8_t* dst) {
+    auto& bo = buffer("xres", 0);
+    read_back(bo, man_.hidden * 4, 0);
+    std::memcpy(dst, bo.map<uint8_t*>(), man_.hidden * 4);
 }
 
 Core::Inflight Core::start_run(Kern& k, const std::vector<std::string>& args, int layer) {
@@ -1599,7 +1618,10 @@ void Core::route(Kern& k, int layer, uint64_t act_off) {
     if (k.moe2.empty()) throw std::runtime_error("open_qwen36: moeroute2 on " + k.name + ", which has no routed-expert table");
     xrt::bo& act = act_[layer];
     const size_t off = act_off + man_.rout_idx_off;
-    if (route_log_on_) {
+    const size_t route_bytes = capture_ ? 2144 : 32;
+    if (capture_) {
+        read_back(act, route_bytes, act_off);
+    } else if (route_log_on_) {
         // the whole record: the router's probabilities, then idx and the weights
         const size_t n = man_.rout_idx_off + 64;
         read_back(act, n, act_off);
@@ -1632,7 +1654,7 @@ void Core::route(Kern& k, int layer, uint64_t act_off) {
                     throw std::runtime_error("open_qwen36: layer " + std::to_string(layer) + " at position " +
                                              std::to_string(pos_) + ": the router record never landed (1 s after its "
                                              "dispatch completed)");
-                read_back(act, 32, off);
+                read_back(act, route_bytes, capture_ ? act_off : off);
                 std::memcpy(idx, act.map<uint8_t*>() + off, 32);
             } while (armed());
         }
@@ -1655,6 +1677,12 @@ void Core::route(Kern& k, int layer, uint64_t act_off) {
     }
     for (unsigned s = 0; s < man_.moe.topk; ++s)
         if (idx[s] >= man_.moe.experts) throw std::runtime_error("open_qwen36: router produced expert index " + std::to_string(idx[s]));
+    if (capture_) {
+        const int32_t slot = capture_->route(*this, layer, act.map<uint8_t*>() + act_off);
+        const size_t control = act_off + man_.moe_capture.at("control_offset").get<size_t>();
+        std::memcpy(act.map<uint8_t*>() + control, &slot, sizeof(slot));
+        act.sync(XCL_BO_SYNC_BO_TO_DEVICE, sizeof(slot), control);
+    }
     stream_patch::moe2_apply(k.iw(), k.moe2, idx, man_.moe);
     k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
     timing_.route_ms += ms_since(t0);
@@ -1703,6 +1731,8 @@ void Core::write_record(size_t row, const double pos[3]) {
 
 void Core::step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
                      const float* deepstack, int n_deepstack) {
+    if (capture_ && (x || mpos || deepstack))
+        throw std::runtime_error("MoE capture supports text token inputs only");
     if (!weights_loaded_) throw std::runtime_error("open_qwen36: step before load_weights");
     if (static_cast<size_t>(pos_) >= cfg_.max_ctx)
         throw std::runtime_error("open_qwen36: position " + std::to_string(pos_) + " reached the context capacity " +
@@ -1782,7 +1812,7 @@ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t*
     //
     // Deepstack (Qwen3-VL) reads xres back between layers, which needs the layer's last
     // dispatch to have landed; the pipeline is off for that path rather than special-cased.
-    const bool pipe = submit_ahead_ > 0 && !deepstack;
+    const bool pipe = submit_ahead_ > 0 && !deepstack && !capture_;
     Inflight head, tail_in;                 // layer l's first dispatch; layer l - 1's last
     for (int l = 0; l < nl_; ++l) {
         const std::vector<Step>& prog = types_[l]->program;
@@ -1805,6 +1835,7 @@ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t*
                     route(k, l, s.act_off);
                 }
             }
+            if (capture_) capture_->after_layer(*this, l);
             if (deepstack && l < n_deepstack) {
                 read_back(xres, man_.hidden * 4, 0);
                 float* r = xres.map<float*>();
@@ -2666,6 +2697,7 @@ void Core::step_gemm_block_layer(int l, std::vector<double>& xres, size_t T, siz
 }
 
 void Core::step_gemm_block(const std::vector<int>& ids, size_t t_real, bool want_logits) {
+    if (capture_) throw std::runtime_error("MoE capture requires per-token NPU execution");
     apply_thread_budget();
     if (!weights_loaded_) throw std::runtime_error("open_qwen36: step_gemm_block before load_weights");
     const size_t T = ids.size();
@@ -2806,6 +2838,7 @@ void Core::step_block_moe(const std::vector<int>& ids, size_t t_real, bool want_
 // expert), and a token's expert output does not depend on which other tokens share its
 // slot, so the result is bit-for-bit the block-major one.
 void Core::step_gemm_prompt(const std::vector<int>& ids, bool want_logits) {
+    if (capture_) throw std::runtime_error("MoE capture requires per-token NPU execution");
     apply_thread_budget();
     if (!layer_major_ok()) throw std::runtime_error("open_qwen36: step_gemm_prompt on a kernel set without a MoE block route");
     if (ids.empty()) throw std::runtime_error("open_qwen36: step_gemm_prompt with no tokens");

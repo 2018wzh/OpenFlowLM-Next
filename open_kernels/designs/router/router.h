@@ -37,6 +37,11 @@ static inline void router_acc_impl(const bfloat16 *__restrict W, const bfloat16 
 // softmax + top-8
 static inline void router_fin_impl(const float *__restrict acc, float *__restrict out) {
   aie::set_rounding(aie::rounding_mode::conv_even);
+#ifdef MOE_CAPTURE
+  for (unsigned j = 0; j < kE; j += kV)
+    aie::store_v(out + 272 + j, aie::load_v<kV>(acc + j));
+  ((int32_t *)out)[528] = -1; // runtime ablation slot; probabilities and weights stay intact
+#endif
   v32f mx = aie::load_v<kV>(acc);
   for (unsigned j = kV; j < kE; j += kV)
     mx = aie::max(mx, aie::load_v<kV>(acc + j));

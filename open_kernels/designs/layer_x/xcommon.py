@@ -34,6 +34,7 @@ from aie.iron.kernel import ExternalFunction
 from aie.helpers.taplib import TensorAccessPattern
 
 from layout import R, SPEC, POOL_BYTES, POOL_DOWN, POOL_SHARE_DOWN, POOL_SHARE_GATE, POOL_SHARE_UP
+from recipes import moe_capture
 from ironutil import Pipeline  # noqa: E402
 
 HERE = Path(__file__).parent
@@ -94,6 +95,10 @@ BAND16, BAND32 = C.BAND16, C.BAND32   # K=HID / K=2*HID band bytes
 N_HDR = C.N_HDR
 ROWS_PC, HID_PC = C.ROWS_PC, C.HID_PC # MoE rows per core, hidden per core
 OS = ["-Os"]                          # main-core kernels: size over speed (the GEMV is DMA-bound)
+CAPTURE = moe_capture.enabled() and KIND == "moe"
+if CAPTURE:
+    OS += ["-DMOE_CAPTURE"]
+CAP = moe_capture.layout(HID, FF, NE, N_CORES)
 # timing-only ablation (output garbage): LX_NULL_GEMV=1 compiles the q4 / q8 GEMV tile body
 # to a zero store -- the GEMV twin of LX_NULL_DN below -- and leaves every stream, fifo and
 # DMA (so insts.bin) exactly as it was, to tell a stream limit from a compute one.
@@ -107,6 +112,8 @@ if os.environ.get("LX_NULL_GEMV") == "1":
 MS_FLOATS = C.MS_FLOATS
 DS_FLOATS = C.DS_FLOATS
 TAB_BYTES = C.TAB_BYTES               # gemv_q4_tab_bytes(widest K); h's table sits at +H_TAB_OFF
+if CAPTURE:
+    TAB_BYTES += FF * 2               # actual rounded down input, tapped in table preparation
 H_TAB_OFF = C.H_TAB_OFF
 KWIDE = C.KWIDE                       # the widest K a main core prepares (the og / out projections)
 
@@ -271,6 +278,8 @@ def kernels(inc, t):
     k["silu"] = ef("moe_silu32", [ms, y])
     k["accfin"] = ef("moe_accfin", [ms, i32])
     k["out"] = ef("moe_out", [ms, y, i32])
+    if CAPTURE:
+        k["capture"] = ef("moe_capture", [ms, tab, y, i32, i32])
     # DeltaNet
     k["vcopy"] = dnf("dnx_vcopy", [e, ds])
     k["p1"] = dnf("dnx_pass1", [e, ds, i32])
@@ -293,7 +302,7 @@ def _knames() -> tuple:
     ns = [n for n in base if (n != "gy" or NEED_Q4_GY) and (n != "gms" or NEED_Q4_GMS)]
     if MIXED:
         ns = ["gyms"] + [n for n in ns if n not in ("gy", "gms")]
-    return tuple(ns) + KNAMES_Q8
+    return tuple(ns) + KNAMES_Q8 + (("capture",) if CAPTURE else ())
 
 
 KNAMES = _knames()
@@ -497,23 +506,47 @@ def moe_body(win, ain, yout, B, K, nx=NX):
         K["hdr"](we, xm, ms, mode)
         win.release(1)
     ain.release(1)
+    if CAPTURE:
+        ye = yout.acquire(1)
+        K["capture"](ms, tab, ye, 5, 0)
+        yout.release(1)
     for e in range_(nx):                          # NE routed slots, then the shared expert
         for b in range_(2):                       # u then g, HID_PC rows each, UP_ELEMS elements per band
             for g in range_(C.UP_ELEMS):
                 we = win.acquire(1)
                 K["gup"](we, tab, ms, g, b)
                 win.release(1)
+        if CAPTURE:
+            for kind in range_(2):
+                ye = yout.acquire(1)
+                K["capture"](ms, tab, ye, kind, 0)
+                yout.release(1)
         he = yout.acquire(1)
         K["silu"](ms, he)                         # this core's rows of the hidden, f32, to DDR
         yout.release(1)
+        if CAPTURE:
+            ye = yout.acquire(1)
+            K["capture"](ms, tab, ye, 2, 0)
+            yout.release(1)
         hh = ain.acquire(1)
         K["prepf"](hh, tab)                       # the whole h back, -> its table (tab + H_TAB_OFF)
         ain.release(1)
+        if CAPTURE:
+            for j in range_(FF * 2 // (BAND_ROWS * 4)):
+                ye = yout.acquire(1)
+                K["capture"](ms, tab, ye, 6, j)
+                yout.release(1)
         for j in range_(C.DOWN_ELEMS):            # the core's ROWS_PC down rows: DOWN_ELEMS elements either way
             we = win.acquire(1)
             K["gdown"](we, tab, ms, j, e)
             win.release(1)
         K["accfin"](ms, e)                        # routed: acc += w[e] y; shared: out = xres + acc + gate y
+        if CAPTURE:
+            for kind in range_(3, 5):
+                for j in range_(C.OUT_ELEMS):
+                    ye = yout.acquire(1)
+                    K["capture"](ms, tab, ye, kind, j)
+                    yout.release(1)
     if nx == NE:
         K["accfin"](ms, -1)                       # no shared slot: out = xres + acc
     for j in range_(C.OUT_ELEMS):
@@ -533,6 +566,9 @@ def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prod
         pipe_w.fill(w_prods[c], a_act, bt(A_BYTES, A_ROUT, CALL_BYTES))
         pipe_w.fill(w_prods[c], a_consts, bt(C_BYTES, C_SGW, CALL_BYTES))
         pipe_w.fill(w_prods[c], a_act, bt(A_BYTES, A_RES + c * ROWS_PC * 4, CALL_BYTES))
+        if CAPTURE:
+            off = A_HP + ELEM + CAP["fields"]["shared_gate"]["offset"] + c * BAND_ROWS * 4
+            pipe_y.drain(y_conss[c], a_act, bt(A_BYTES, off, BAND_ROWS * 4))
     for e in range(nx):
         for c in range(N_CORES):
             if e < NE:
@@ -542,9 +578,19 @@ def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prod
             else:
                 pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_UP + c * HALF, HALF))
                 pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_GATE + c * HALF, HALF))
-            pipe_y.drain(y_conss[c], a_act, bt(A_BYTES, A_HP + c * HID_PC * 4, HID_PC * 4))
+            if CAPTURE:
+                for name in ("up", "gate", "product", "silu"):
+                    f = CAP["fields"][name]
+                    off = A_HP + ELEM + f["offset"] + e * f["stride"] + c * HID_PC * 4
+                    pipe_y.drain(y_conss[c], a_act, bt(A_BYTES, off, HID_PC * 4))
+            else:
+                pipe_y.drain(y_conss[c], a_act, bt(A_BYTES, A_HP + c * HID_PC * 4, HID_PC * 4))
         pipe_y.finish(*y_conss)                           # the hidden parts are in DDR
-        pipe_x.fill(x_prod, a_act, bt(A_BYTES, A_HP, ELEM))
+        h_off = A_HP
+        if CAPTURE:
+            f = CAP["fields"]["product"]
+            h_off = A_HP + ELEM + f["offset"] + e * f["stride"]
+        pipe_x.fill(x_prod, a_act, bt(A_BYTES, h_off, ELEM))
         for c in range(N_CORES):
             if e < NE:
                 pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_DOWN + e * UP_BYTES + c * DOWN_PER_CORE * DOWN_BAND,
@@ -552,6 +598,13 @@ def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prod
             else:
                 pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_DOWN + c * DOWN_PER_CORE * DOWN_BAND,
                                                    DOWN_PER_CORE * DOWN_BAND))
+            if CAPTURE:
+                for name, size, core_size in (("down_input", FF * 2, FF * 2),
+                                               ("down", ROWS_PC * 4, ROWS_PC * 4),
+                                               ("accumulator", ROWS_PC * 4, ROWS_PC * 4)):
+                    f = CAP["fields"][name]
+                    off = A_HP + ELEM + f["offset"] + e * f["stride"] + c * core_size
+                    pipe_y.drain(y_conss[c], a_act, bt(A_BYTES, off, size))
     for c in range(N_CORES):
         pipe_y.drain(y_conss[c], c_xres, bt(HID, c * ROWS_PC, ROWS_PC))   # the block output = the new residual
     pipe_w.finish()
@@ -668,7 +721,8 @@ def ln_kernels(inc, t):
     k["ln"] = ExternalFunction("ln_fn", source_file=str(LN / "ln.cc"), arg_types=[u] * 8, include_dirs=inc)
     k["rcopy"] = ExternalFunction("router_copy_x", source_file=str(RT / "router_copy.cc"), arg_types=[u, t["xb"]], include_dirs=inc)
     k["racc"] = ExternalFunction("router_acc", source_file=str(RT / "router.cc"), arg_types=[u, t["xb"], t["racc"], np.int32], include_dirs=inc)
-    k["rfin"] = ExternalFunction("router_fin", source_file=str(RT / "router_fin.cc"), arg_types=[t["racc"], u], include_dirs=inc)
+    k["rfin"] = ExternalFunction("router_fin", source_file=str(RT / "router_fin.cc"), arg_types=[t["racc"], u], include_dirs=inc,
+                                compile_flags=["-DMOE_CAPTURE"] if CAPTURE else [])
     return k
 
 

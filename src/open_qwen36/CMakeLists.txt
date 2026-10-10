@@ -34,7 +34,7 @@ set(_inc
     "${CMAKE_CURRENT_SOURCE_DIR}/../../open_kernels/harness"  # stream_patch.hpp
 )
 
-add_executable(open_qwen36_cli cli.cpp core.cpp block_host.cpp pools.cpp manifest.cpp q4nx_file.cpp)
+add_executable(open_qwen36_cli cli.cpp capture.cpp core.cpp block_host.cpp pools.cpp manifest.cpp q4nx_file.cpp)
 target_include_directories(open_qwen36_cli PRIVATE "${XRT_INCLUDE_DIR}" ${_inc})
 target_link_directories(open_qwen36_cli PRIVATE "${XRT_LIB_DIR}")
 target_link_libraries(open_qwen36_cli PRIVATE xrt_coreutil)
@@ -67,10 +67,14 @@ endforeach()
 
 foreach(t open_qwen36_cli manifest_test vit_test block_host_test)
     if(MSVC)
-        target_compile_options(${t} PRIVATE /EHsc /Zc:__cplusplus /bigobj)
+        target_compile_options(${t} PRIVATE /EHsc /Zc:__cplusplus /bigobj /utf-8)
         target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     endif()
 endforeach()
+if(MSVC)
+    target_link_options(open_qwen36_cli PRIVATE /DELAYLOAD:VCOMP140.DLL)
+    target_link_libraries(open_qwen36_cli PRIVATE delayimp)
+endif()
 
 enable_testing()
 add_test(NAME OPEN-VISION-VIT-CONFIG COMMAND vit_test --configs

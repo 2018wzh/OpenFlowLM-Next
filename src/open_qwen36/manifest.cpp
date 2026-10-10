@@ -147,6 +147,8 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
     if (m.version < 1 || m.version > 3)
         fail(where, "manifest_version " + std::to_string(m.version) + " (this engine reads 1 to 3)");
     m.family = get<std::string>(j, "family", where);
+    m.moe_capture = j.value("moe_capture", json());
+    m.model_spec = j.value("spec", json::object());
     m.spec_hash = j.value("spec_hash", "");
     m.build_key = j.value("build_key", "");
     m.max_ctx_default = j.value("max_ctx_default", 4096ull);

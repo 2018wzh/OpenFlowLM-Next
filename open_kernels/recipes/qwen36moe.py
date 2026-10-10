@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from .catalogue import LIMITS, OpRangeError, check_buffer_args, require
 from .attnknobs import knobs as attn_knobs, probe_env as _attn_probe_env
 from .spec import FULL, LINEAR, QUANT_FORMATS, ModelSpec
+from . import moe_capture
 
 
 def one_context() -> bool:
@@ -41,7 +42,7 @@ def merged_image(spec: ModelSpec) -> bool:
     """Whether this spec's layer kernels are the merged image. It needs both layer types, and
     no q8 projection role: ux.py's main-core program has room for ONE GEMV entry (the main
     cores sit at 16256 of 16384 bytes), so a q8 model of the family keeps lx/ax."""
-    return one_context() and spec.has_linear and spec.has_full and not spec.q8_roles
+    return one_context() and spec.has_linear and spec.has_full and not spec.q8_roles and not moe_capture.enabled()
 
 
 def probe_env() -> dict[str, str]:
@@ -50,6 +51,8 @@ def probe_env() -> dict[str, str]:
     emits, and nothing else in the key can see it, so without this a merged set and an
     lx/ax set would share a key and the second would be skipped."""
     e = dict(_attn_probe_env())
+    if moe_capture.enabled():
+        e["OFLM_MOE_CAPTURE"] = "1"
     if one_context():
         e["OPEN_LAYER_ONE_CTX"] = "1"
     return e
@@ -662,6 +665,8 @@ def layout(spec: ModelSpec, max_ctx: int = 4096, ffn: str = "moe") -> Layout:
         a.add("xm", ELEM)
         a.add("rout", CALL_BYTES)
         a.add("hp", ELEM)
+        if moe_capture.enabled():
+            a.add("capture", moe_capture.layout(hid, C.FF, C.NE, n)["bytes"])
         kv.update(A_XN=a.off["xn"], A_QKV=a.off["qkv"], A_Z=a.off["z"], A_VEC=a.off["vec"], A_O=a.off["o"],
                   A_OG=a.off["og"], A_OUT=a.off["out"], A_RES=a.off["res"], A_XM=a.off["xm"],
                   A_ROUT=a.off["rout"], A_HP=a.off["hp"], A_BYTES=a.n)
@@ -702,6 +707,8 @@ def layout(spec: ModelSpec, max_ctx: int = 4096, ffn: str = "moe") -> Layout:
         a.add("xm", ELEM)
         a.add("rout", CALL_BYTES)
         a.add("hp", ELEM)
+        if moe_capture.enabled():
+            a.add("capture", moe_capture.layout(hid, C.FF, C.NE, n)["bytes"])
         kv.update(AA_XN=a.off["xn"], AA_QG=a.off["qg"], AA_KVN=a.off["kvn"], AA_OG=a.off["og"], AA_OUT=a.off["out"],
                   AA_RES=a.off["res"], AA_XM=a.off["xm"], AA_ROUT=a.off["rout"], AA_HP=a.off["hp"], AA_BYTES=a.n)
         kv_row = 2 * kvw * 2                           # [K_t bf16 | V_t bf16]
